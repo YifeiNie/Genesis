@@ -201,7 +201,3 @@ class FPSTracker:
         else:
             self.total_fps = fps
             # gs.logger.info(f"Running at ~<{fps:.2f}>~ FPS.")
-        if self.compensate_logging_cost:  # skip logging cost
-            self.last_time = time.perf_counter()
-        else:
-            self.last_time = current_time
