@@ -41,6 +41,7 @@ class ViewerOptions(Options):
     camera_lookat: tuple = (0.0, 0.0, 0.5)
     camera_up: tuple = (0.0, 0.0, 1.0)
     camera_fov: float = 40
+    enable_interaction: bool = False
 
 
 class VisOptions(Options):
@@ -132,6 +133,9 @@ class VisOptions(Options):
             )
 
         if not self.n_rendered_envs is None:
-            gs.logger.warning("n_rendered_envs is deprecated. Please use rendered_envs_idx instead.")
+            gs.logger.warning(
+                "Viewer option 'n_rendered_envs' is deprecated and will be removed in future release. Please use "
+                "'rendered_envs_idx' instead."
+            )
             assert self.rendered_envs_idx is None
             self.rendered_envs_idx = list(range(self.n_rendered_envs))

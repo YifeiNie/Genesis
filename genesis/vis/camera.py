@@ -8,6 +8,7 @@ import numpy as np
 import genesis as gs
 import genesis.utils.geom as gu
 from genesis.repr_base import RBC
+from genesis.utils.misc import tensor_to_array
 
 
 class Camera(RBC):
@@ -91,6 +92,7 @@ class Camera(RBC):
         self._is_built = False
         self._attached_link = None
         self._attached_offset_T = None
+        self._attached_env_idx = None
 
         self._in_recording = False
         self._recorded_imgs = []
@@ -124,23 +126,69 @@ class Camera(RBC):
         self._is_built = True
         self.set_pose(self._transform, self._pos, self._lookat, self._up)
 
-    def attach(self, rigid_link, offset_T):
+    def attach(self, rigid_link, offset_T, env_idx: int | None = None):
+        """
+        Attach the camera to a rigid link in the scene.
+
+        Once attached, the camera's position and orientation can be updated relative to the attached link using `move_to_attach()`. This is useful for mounting the camera to dynamic entities like robots or articulated objects.
+
+        Parameters
+        ----------
+        rigid_link : genesis.RigidLink
+            The rigid link to which the camera should be attached.
+        offset_T : np.ndarray, shape (4, 4)
+            The transformation matrix specifying the camera's pose relative to the rigid link.
+        env_idx : int
+            The environment index this camera should be tied to. Offsets the `offset_T` accordingly. Must be specified
+            if running parallel environments
+
+        Raises
+        ------
+        Exception
+            If running parallel simulations but env_idx is not specified.
+        Exception
+            If invalid env_idx is specified (env_idx >= n_envs)
+        """
         self._attached_link = rigid_link
         self._attached_offset_T = offset_T
+        if self._visualizer._scene.n_envs > 0 and env_idx is None:
+            gs.raise_exception("Must specify env_idx when running parallel simulations")
+        if env_idx is not None:
+            n_envs = self._visualizer._scene.n_envs
+            if env_idx >= n_envs:
+                gs.raise_exception(f"Invalid env_idx {env_idx} for camera, configured for {n_envs} environments")
+            self._attached_env_idx = env_idx
 
     def detach(self):
+        """
+        Detach the camera from the currently attached rigid link.
+
+        After detachment, the camera will stop following the motion of the rigid link and maintain its current world pose. Calling this method has no effect if the camera is not currently attached.
+        """
         self._attached_link = None
         self._attached_offset_T = None
+        self._attached_env_idx = None
 
     @gs.assert_built
     def move_to_attach(self):
+        """
+        Move the camera to follow the currently attached rigid link.
+
+        This method updates the camera's pose using the transform of the attached rigid link combined with the specified offset. It should only be called after `attach()` has been used. This method is not compatible with simulations running multiple environments in parallel.
+
+        Raises
+        ------
+        Exception
+            If the camera has not been mounted using `attach()`.
+        """
         if self._attached_link is None:
             gs.raise_exception(f"The camera hasn't been mounted!")
-        if self._visualizer._scene.n_envs > 0:
-            gs.raise_exception(f"Mounted camera not supported in parallel simulation!")
 
-        link_pos = self._attached_link.get_pos().cpu().numpy()
-        link_quat = self._attached_link.get_quat().cpu().numpy()
+        link_pos = tensor_to_array(self._attached_link.get_pos(envs_idx=self._attached_env_idx))
+        link_quat = tensor_to_array(self._attached_link.get_quat(envs_idx=self._attached_env_idx))
+        if self._attached_env_idx is not None:
+            link_pos = link_pos[0] + self._visualizer._scene.envs_offset[self._attached_env_idx]
+            link_quat = link_quat[0]
         link_T = gu.trans_quat_to_T(link_pos, link_quat)
         transform = link_T @ self._attached_offset_T
         self.set_pose(transform=transform)
@@ -300,7 +348,7 @@ class Camera(RBC):
                 K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]])
                 return K
 
-            def backproject_depth_to_pointcloud(K: np.ndarray, depth: np.ndarray, pose, world):
+            def backproject_depth_to_pointcloud(K: np.ndarray, depth: np.ndarray, pose, world, znear, zfar):
                 """Convert depth image to pointcloud given camera intrinsics.
                 Args:
                     depth (np.ndarray): Depth image.
@@ -313,10 +361,12 @@ class Camera(RBC):
                 _cy = K[1, 2]
 
                 # Mask out invalid depth
-                mask = np.where(depth > -1.0)
-                depth = np.maximum(depth, -0.99)
-                mask1 = np.where(depth > -1.0)
-                x, y = mask1[1], mask1[0]
+                mask = np.where((depth > znear) & (depth < zfar * 0.99))
+                # zfar * 0.99 for filtering out precision error of float
+                height, width = depth.shape
+                y, x = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
+                x = x.flatten()
+                y = y.flatten()
 
                 # Normalize pixel coordinates
                 normalized_x = x.astype(np.float32) - _cx
@@ -348,7 +398,9 @@ class Camera(RBC):
             T_OPENGL_TO_OPENCV = np.array([[1, 0, 0, 0], [0, -1, 0, 0], [0, 0, -1, 0], [0, 0, 0, 1]])
             cam_pose = self._rasterizer._camera_nodes[self.uid].matrix @ T_OPENGL_TO_OPENCV
 
-            pc, mask = backproject_depth_to_pointcloud(intrinsic_K, depth_arr, cam_pose, world_frame)
+            pc, mask = backproject_depth_to_pointcloud(
+                intrinsic_K, depth_arr, cam_pose, world_frame, self.near, self.far
+            )
 
             return pc, mask
 

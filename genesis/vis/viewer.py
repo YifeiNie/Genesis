@@ -1,6 +1,7 @@
 import os
 import threading
 import importlib
+from typing import TYPE_CHECKING
 
 import numpy as np
 import OpenGL.error
@@ -12,6 +13,10 @@ import genesis.utils.geom as gu
 from genesis.ext import pyrender
 from genesis.repr_base import RBC
 from genesis.utils.tools import Rate
+from genesis.utils.misc import redirect_libc_stderr
+
+if TYPE_CHECKING:
+    from genesis.options.vis import ViewerOptions
 
 
 class ViewerLock:
@@ -26,7 +31,7 @@ class ViewerLock:
 
 
 class Viewer(RBC):
-    def __init__(self, options, context):
+    def __init__(self, options: "ViewerOptions", context):
         self._res = options.res
         self._run_in_thread = options.run_in_thread
         self._refresh_rate = options.refresh_rate
@@ -35,6 +40,7 @@ class Viewer(RBC):
         self._camera_init_lookat = options.camera_lookat
         self._camera_up = options.camera_up
         self._camera_fov = options.camera_fov
+        self._enable_interaction = options.enable_interaction
 
         self._pyrender_viewer = None
         self.context = context
@@ -71,23 +77,25 @@ class Viewer(RBC):
 
             try:
                 gs.logger.debug(f"Trying to create OpenGL Context for PYOPENGL_PLATFORM='{platform}'...")
-                self._pyrender_viewer = pyrender.Viewer(
-                    context=self.context,
-                    viewport_size=self._res,
-                    run_in_thread=self._run_in_thread,
-                    auto_start=False,
-                    view_center=self._camera_init_lookat,
-                    shadow=self.context.shadow,
-                    plane_reflection=self.context.plane_reflection,
-                    env_separate_rigid=self.context.env_separate_rigid,
-                    viewer_flags={
-                        "window_title": f"Genesis {gs.__version__}",
-                        "refresh_rate": self._refresh_rate,
-                    },
-                )
-                if not self._run_in_thread:
-                    self._pyrender_viewer.start(auto_refresh=False)
-                self._pyrender_viewer.wait_until_initialized()
+                with open(os.devnull, "w") as stderr, redirect_libc_stderr(stderr):
+                    self._pyrender_viewer = pyrender.Viewer(
+                        context=self.context,
+                        viewport_size=self._res,
+                        run_in_thread=self._run_in_thread,
+                        auto_start=False,
+                        view_center=self._camera_init_lookat,
+                        shadow=self.context.shadow,
+                        plane_reflection=self.context.plane_reflection,
+                        env_separate_rigid=self.context.env_separate_rigid,
+                        enable_interaction=self._enable_interaction,
+                        viewer_flags={
+                            "window_title": f"Genesis {gs.__version__}",
+                            "refresh_rate": self._refresh_rate,
+                        },
+                    )
+                    if not self._run_in_thread:
+                        self._pyrender_viewer.start(auto_refresh=False)
+                    self._pyrender_viewer.wait_until_initialized()
                 break
             except OpenGL.error.Error:
                 # Invalid OpenGL context. Trying another platform if any...
@@ -138,9 +146,7 @@ class Viewer(RBC):
             self.update_following()
 
         with self.lock:
-            buffer_updates = self.context.update()
-            for buffer_id, buffer_data in buffer_updates.items():
-                self._pyrender_viewer.pending_buffer_updates[buffer_id] = buffer_data
+            self._pyrender_viewer.pending_buffer_updates |= self.context.update()
 
             # Refresh viewer by default if and if this is possible
             if auto_refresh is None:

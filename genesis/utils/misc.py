@@ -1,17 +1,20 @@
+import ctypes
 import datetime
 import functools
-import os
-import types
+import logging
 import platform
 import random
-import logging
+import types
 import shutil
 import subprocess
+import sys
+import os
 from dataclasses import dataclass
 from collections import OrderedDict
 from typing import Any
 
 import numpy as np
+import cpuinfo
 import psutil
 import torch
 
@@ -34,13 +37,81 @@ class DeprecationError(Exception):
 
 
 def raise_exception(msg="Something went wrong."):
-    gs.logger._error_msg = msg
     raise gs.GenesisException(msg)
 
 
 def raise_exception_from(msg="Something went wrong.", cause=None):
-    gs.logger._error_msg = msg
     raise gs.GenesisException(msg) from cause
+
+
+class redirect_libc_stderr:
+    """
+    Context-manager that temporarily redirects C / C++ std::cerr (i.e. the C `stderr` file descriptor 2) to a given
+    Python file-like object's fd.
+
+    Works on macOS, Linux (glibc / musl), and Windows (MSVCRT / Universal CRT ≥ VS2015).
+    """
+
+    def __init__(self, fd):
+        self.fd = fd
+        self.stderr_fileno = None
+        self.original_stderr_fileno = None
+
+    def __enter__(self):
+        self.stderr_fileno = sys.stderr.fileno()
+        self.original_stderr_fileno = os.dup(self.stderr_fileno)
+        sys.stderr.flush()
+
+        if os.name == "posix":  # macOS, Linux, *BSD, …
+            libc = ctypes.CDLL(None)
+            libc.fflush(None)
+            libc.dup2(self.fd.fileno(), self.stderr_fileno)
+        elif os.name == "nt":  # Windows
+            # FIXME: Do not redirect stderr on Windows OS when running pytest, otherwise it will raise this exception:
+            # "OSError: [WinError 6] The handle is invalid"
+            if "PYTEST_VERSION" not in os.environ:
+                msvcrt = ctypes.CDLL("msvcrt")
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+                msvcrt.fflush(None)
+                msvcrt._dup2(self.fd.fileno(), self.stderr_fileno)
+
+                STDERR_HANDLE = -12
+                new_os_handle = msvcrt._get_osfhandle(self.fd.fileno())
+                kernel32.SetStdHandle(STDERR_HANDLE, new_os_handle)
+        else:
+            gs.logger.warning(f"Unsupported platform for redirecting libc stderr: {sys.platform}")
+
+        return self
+
+    # --------------------------------------------------
+    # Exit: restore previous stderr, close the temp copy
+    # --------------------------------------------------
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self.stderr_fileno is None:
+            return
+
+        if os.name == "posix":
+            libc = ctypes.CDLL(None)
+            sys.stderr.flush()
+            libc.fflush(None)
+            libc.dup2(self.original_stderr_fileno, self.stderr_fileno)
+        elif os.name == "nt":
+            if "PYTEST_VERSION" not in os.environ:
+                msvcrt = ctypes.CDLL("msvcrt")
+                kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+                sys.stderr.flush()
+                msvcrt.fflush(None)
+                msvcrt._dup2(self.original_stderr_fileno, self.stderr_fileno)
+
+                STDERR_HANDLE = -12
+                orig_os_handle = msvcrt._get_osfhandle(self.original_stderr_fileno)
+                kernel32.SetStdHandle(STDERR_HANDLE, orig_os_handle)
+
+        os.close(self.original_stderr_fileno)
+        self.stderr_fileno = None
+        self.original_stderr_fileno = None
 
 
 def assert_initialized(cls):
@@ -102,33 +173,14 @@ def get_platform():
     assert False, f"Unknown platform name {name}"
 
 
-def get_cpu_name():
-    if get_platform() == "macOS":
-        os.environ["PATH"] = os.environ["PATH"] + os.pathsep + "/usr/sbin"
-        command = "sysctl -n machdep.cpu.brand_string"
-        process = subprocess.run(command, shell=True, capture_output=True, text=True)
-        return process.stdout.strip()
-
-    elif get_platform() == "Linux":
-        command = "cat /proc/cpuinfo"
-        process = subprocess.run(command, shell=True, capture_output=True, text=True)
-        all_info = process.stdout.strip()
-        for line in all_info.split("\n"):
-            if "model name" in line:
-                return line.replace("\t", "").replace("model name: ", "")
-
-    else:
-        return platform.processor()
-
-
 def get_device(backend: gs_backend):
     if backend == gs_backend.cuda:
         if not torch.cuda.is_available():
-            gs.raise_exception("cuda device not available")
+            gs.raise_exception("torch cuda not available")
 
         device_idx = torch.cuda.current_device()
-        device = torch.device(f"cuda:{device_idx}")
-        device_property = torch.cuda.get_device_properties(device_idx)
+        device = torch.device("cuda", device_idx)
+        device_property = torch.cuda.get_device_properties(device)
         device_name = device_property.name
         total_mem = device_property.total_memory / 1024**3
 
@@ -138,18 +190,22 @@ def get_device(backend: gs_backend):
 
         # on mac, cpu and gpu are in the same device
         _, device_name, total_mem, _ = get_device(gs_backend.cpu)
-        device = torch.device("mps:0")
+        device = torch.device("mps", 0)
 
     elif backend == gs_backend.vulkan:
-        if torch.xpu.is_available():  # pytorch 2.5+ supports Intel XPU device
+        if torch.cuda.is_available():
+            device, device_name, total_mem, _ = get_device(gs_backend.cuda)
+        elif torch.xpu.is_available():  # pytorch 2.5+ supports Intel XPU device
             device_idx = torch.xpu.current_device()
-            device = torch.device(f"xpu:{device_idx}")
+            device = torch.device("xpu", device_idx)
             device_property = torch.xpu.get_device_properties(device_idx)
             device_name = device_property.name
             total_mem = device_property.total_memory / 1024**3
         else:  # pytorch tensors on cpu
             # logger may not be configured at this point
-            (gs.logger or LOGGER).warning("No Intel XPU device available. Falling back to CPU for torch device.")
+            getattr(gs, "logger", LOGGER).warning(
+                "No Intel XPU device available. Falling back to CPU for torch device."
+            )
             device, device_name, total_mem, _ = get_device(gs_backend.cpu)
 
     elif backend == gs_backend.gpu:
@@ -161,7 +217,7 @@ def get_device(backend: gs_backend):
             return get_device(gs_backend.vulkan)
 
     else:
-        device_name = get_cpu_name()
+        device_name = cpuinfo.get_cpu_info()["brand_raw"]
         total_mem = psutil.virtual_memory().total / 1024**3
         device = torch.device("cpu")
 
@@ -183,6 +239,9 @@ def get_assets_dir():
 
 
 def get_cache_dir():
+    cache_dir = os.environ.get("GS_CACHE_FILE_PATH")
+    if cache_dir is not None:
+        return cache_dir
     return os.path.join(os.path.expanduser("~"), ".cache", "genesis")
 
 
@@ -268,6 +327,7 @@ MAX_CACHE_SIZE = 1000
 
 @dataclass
 class FieldMetadata:
+    ndim: int
     shape: tuple[int, ...]
     dtype: ti._lib.core.DataType
     mapping_key: Any
@@ -373,7 +433,7 @@ def ti_field_to_torch(
         row_mask (optional): Rows to extract from batch dimension after transpose if requested.
         col_mask (optional): Columns to extract from batch dimension field after transpose if requested.
         keepdim (bool, optional): Whether to keep all dimensions even if masks are integers.
-        transpose (bool, optional): Whether to transpose the first two batch dimensions.
+        transpose (bool, optional): Whether move to front the first field dimension.
         unsafe (bool, optional): Whether to skip validity check of the masks.
 
     Returns:
@@ -383,7 +443,9 @@ def ti_field_to_torch(
     field_id = id(field)
     field_meta = FIELD_CACHE.get(field_id)
     if field_meta is None:
-        field_meta = FieldMetadata(field.shape, field.dtype, None)
+        field_meta = FieldMetadata(
+            field.ndim if isinstance(field, ti.lang.MatrixField) else 0, field.shape, field.dtype, None
+        )
         if len(FIELD_CACHE) == MAX_CACHE_SIZE:
             FIELD_CACHE.popitem(last=False)
         FIELD_CACHE[field_id] = field_meta
@@ -410,10 +472,9 @@ def ti_field_to_torch(
                     gs.raise_exception(f"Expecting 1D tensor for masks.")
                 # Resort on post-mortem analysis for bounds check because runtime would be to costly
                 is_out_of_bounds = None
-            else:  # np.ndarray
-                mask_start, mask_end = mask[0], mask[-1]
+            else:  # np.ndarray, list, tuple, range
                 try:
-                    mask_start, mask_end = int(mask_start), int(mask_end)
+                    mask_start, mask_end = min(mask), max(mask)
                 except ValueError:
                     gs.raise_exception(f"Expecting 1D tensor for masks.")
                 is_out_of_bounds = not (0 <= mask_start <= mask_end < _field_shape[i])
@@ -463,7 +524,7 @@ def ti_field_to_torch(
     # Note that it is worth transposing here rather than outside this function, as it preserve row-major memory
     # alignment in case of advanced masking, which would spare computation later on if expected from the user.
     if transpose and not is_1D_batch:
-        out = out.transpose(1, 0)
+        out = out.movedim(out.ndim - field_meta.ndim - 1, 0)
 
     # Extract slice if necessary.
     # Note that unsqueeze is MUCH faster than indexing with `[row_mask]` to keep batch dimensions,

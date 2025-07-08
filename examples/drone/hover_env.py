@@ -1,5 +1,6 @@
 import torch
 import math
+import copy
 import genesis as gs
 from genesis.utils.geom import quat_to_xyz, transform_by_quat, inv_quat, transform_quat_by_quat
 
@@ -16,6 +17,7 @@ class HoverEnv:
         self.num_privileged_obs = None
         self.num_actions = env_cfg["num_actions"]
         self.num_commands = command_cfg["num_commands"]
+        self.device = gs.device
 
         self.simulate_action_latency = env_cfg["simulate_action_latency"]
         self.dt = 0.01  # run in 100hz
@@ -27,7 +29,7 @@ class HoverEnv:
         self.command_cfg = command_cfg
 
         self.obs_scales = obs_cfg["obs_scales"]
-        self.reward_scales = reward_cfg["reward_scales"]
+        self.reward_scales = copy.deepcopy(reward_cfg["reward_scales"])
 
         # create scene
         self.scene = gs.Scene(
@@ -112,6 +114,7 @@ class HoverEnv:
         self.last_base_pos = torch.zeros_like(self.base_pos)
 
         self.extras = dict()  # extra information for logging
+        self.extras["observations"] = dict()
 
     def _resample_commands(self, envs_idx):
         self.commands[envs_idx, 0] = gs_rand_float(*self.command_cfg["pos_x_range"], (len(envs_idx),), gs.device)
@@ -132,7 +135,7 @@ class HoverEnv:
         self.drone.set_propellels_rpm((1 + exec_actions * 0.8) * 14468.429183500699)
         # update target pos
         if self.target is not None:
-            self.target.set_pos(self.commands, zero_velocity=True, envs_idx=list(range(self.num_envs)))
+            self.target.set_pos(self.commands, zero_velocity=True)
         self.scene.step()
 
         # update buffers
@@ -192,11 +195,13 @@ class HoverEnv:
         )
 
         self.last_actions[:] = self.actions[:]
+        self.extras["observations"]["critic"] = self.obs_buf
 
-        return self.obs_buf, None, self.rew_buf, self.reset_buf, self.extras
+        return self.obs_buf, self.rew_buf, self.reset_buf, self.extras
 
     def get_observations(self):
-        return self.obs_buf
+        self.extras["observations"]["critic"] = self.obs_buf
+        return self.obs_buf, self.extras
 
     def get_privileged_observations(self):
         return None

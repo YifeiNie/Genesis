@@ -76,10 +76,15 @@ class Logger:
         self._logger.addHandler(self._handler)
 
         self._stream = self._handler.stream
-        self._error_msg = None
         self._is_new_line = True
 
         self.timer_lock = threading.Lock()
+
+    def addFilter(self, filter):
+        self._logger.addFilter(filter)
+
+    def removeFilter(self, filter):
+        self._logger.removeFilter(filter)
 
     def removeHandler(self, handler):
         self._logger.removeHandler(handler)
@@ -93,7 +98,7 @@ class Logger:
         self.timer_lock.acquire()
 
         # swap with timer output
-        if not self._is_new_line:
+        if not self._is_new_line and not self._stream.closed:
             self._stream.write("\r")
         try:
             yield
@@ -108,6 +113,10 @@ class Logger:
             yield
         finally:
             self.timer_lock.release()
+
+    def log(self, level, msg, *args, **kwargs):
+        with self.log_wrapper():
+            self._logger.log(level, msg, *args, **kwargs)
 
     def debug(self, message):
         with self.log_wrapper():
@@ -130,7 +139,6 @@ class Logger:
             self._logger.critical(message)
 
     def raw(self, message):
-
         self._stream.write(self._formatter.extra_fmt(message))
         self._stream.flush()
         if message.endswith("\n"):

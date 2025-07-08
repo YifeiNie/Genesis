@@ -3,7 +3,10 @@ import os
 
 import OpenGL.platform
 
+import genesis as gs
+
 from .base import Platform
+
 
 EGL_PLATFORM_DEVICE_EXT = 0x313F
 EGL_DRM_DEVICE_FILE_EXT = 0x3233
@@ -86,7 +89,6 @@ def get_device_by_index(device_id):
 
 
 class EGLDevice:
-
     def __init__(self, display=None):
         self._display = display
 
@@ -114,17 +116,20 @@ class EGLDevice:
 class EGLPlatform(Platform):
     """Renders using EGL."""
 
-    def __init__(self, viewport_width, viewport_height, device: EGLDevice = None):
+    def __init__(self, viewport_width, viewport_height, device_id: int | None = None):
         super(EGLPlatform, self).__init__(viewport_width, viewport_height)
+        if _eglQueryDevicesEXT is None and device_id not in (0, None):
+            raise RuntimeError("EGL platform plugin is not available. Enforcing specific EGL device not supported.")
+        self._egl_device_id = device_id
         self._egl_device = None
         self._egl_display = None
         self._egl_context = None
 
     def init_context(self):
         _ensure_egl_loaded()
-
         from OpenGL.EGL import (
             EGL_SURFACE_TYPE,
+            EGL_NO_SURFACE,
             EGL_PBUFFER_BIT,
             EGL_BLUE_SIZE,
             EGL_RED_SIZE,
@@ -148,6 +153,7 @@ class EGLPlatform(Platform):
             eglChooseConfig,
             eglBindAPI,
             eglCreateContext,
+            eglMakeCurrent,
             EGLConfig,
             EGLError,
         )
@@ -190,15 +196,20 @@ class EGLPlatform(Platform):
         configs = (EGLConfig * 1)()
 
         # Get the list of devices to try on
-        if self._egl_device is None:
-            if _eglQueryDevicesEXT is None:
-                devices = (EGLDevice(None),)
-            devices = query_devices()
+        if _eglQueryDevicesEXT is None:
+            all_devices = (EGLDevice(None),)
         else:
-            devices = (self._egl_device,)
+            all_devices = query_devices()
+        if _eglQueryDevicesEXT is None or self._egl_device_id is None:
+            devices = all_devices
+        else:
+            devices = (get_device_by_index(self._egl_device_id),)
 
         # Get the first EGL device that is working
+        error = None
         for i, device in enumerate(devices):
+            gs.logger.debug(f"Trying to create EGL Context for EGL_DEVICE_ID='{self._egl_device_id or i}'...")
+
             # Cache DISPLAY if necessary and get an off-screen EGL display
             orig_dpy = None
             if "DISPLAY" in os.environ:
@@ -222,13 +233,18 @@ class EGLPlatform(Platform):
                 # Create an EGL context
                 egl_context = eglCreateContext(egl_display, configs[0], EGL_NO_CONTEXT, context_attributes)
 
+                # Select EGL context
+                assert eglMakeCurrent(egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, egl_context)
+
                 break
-            except EGLError:
-                # Ignore the error unless there is no device left to check
-                if i == len(devices) - 1:
-                    raise
+            except (AssertionError, EGLError) as e:
+                error = e
         else:
-            raise EGLError("No EGL device detected.")
+            if self._egl_device_id is None:
+                err_msg = "No EGL context could be initialized."
+            else:
+                err_msg = f"No EGL context could not be initialized for EGL_DEVICE_ID='{self._egl_device_id or i}'."
+            raise EGLError(err_msg) from error
 
         # Backup the device and display that will be used
         self._egl_device = device

@@ -11,10 +11,10 @@ from threading import Event, RLock, Semaphore, Thread
 import imageio
 import numpy as np
 import OpenGL
+from OpenGL.GL import *
 
 import genesis as gs
-
-import sys
+from genesis.vis.rasterizer_context import RasterizerContext
 
 if sys.platform.startswith("darwin"):
     # Mac OS
@@ -55,13 +55,19 @@ from .constants import (
     RenderFlags,
     TextAlign,
 )
+from .interaction.viewer_interaction import ViewerInteraction
+from .interaction.viewer_interaction_base import ViewerInteractionBase, EVENT_HANDLE_STATE
 from .light import DirectionalLight
 from .node import Node
 from .renderer import Renderer
 from .shader_program import ShaderProgram, ShaderProgramCache
 from .trackball import Trackball
 
+
 pyglet.options["shadow_window"] = False
+
+
+MODULE_DIR = os.path.dirname(__file__)
 
 
 class Viewer(pyglet.window.Window):
@@ -197,7 +203,7 @@ class Viewer(pyglet.window.Window):
 
     def __init__(
         self,
-        context,
+        context: RasterizerContext,
         viewport_size=None,
         render_flags=None,
         viewer_flags=None,
@@ -207,6 +213,7 @@ class Viewer(pyglet.window.Window):
         shadow=False,
         plane_reflection=False,
         env_separate_rigid=False,
+        enable_interaction=False,
         **kwargs,
     ):
         #######################################################################
@@ -372,6 +379,16 @@ class Viewer(pyglet.window.Window):
         self.scene.main_camera_node = self._camera_node
         self._reset_view()
 
+        # Setup mouse interaction
+
+        # Note: context.scene is genesis.engine.scene.Scene
+        # Note: context._scene is genesis.ext.pyrender.scene.Scene
+        self.viewer_interaction = (
+            ViewerInteraction(self._camera_node, context.scene, viewport_size, camera.yfov)
+            if enable_interaction
+            else ViewerInteractionBase()
+        )
+
         #######################################################################
         # Initialize OpenGL context and renderer
         #######################################################################
@@ -536,6 +553,7 @@ class Viewer(pyglet.window.Window):
         manipulate the scene afterwards.
         """
         if self._run_in_thread:
+            self._is_active = False
             while self._thread.is_alive():
                 time.sleep(1.0 / self.viewer_flags["refresh_rate"])
         else:
@@ -639,7 +657,7 @@ class Viewer(pyglet.window.Window):
 
     def update_buffers(self):
         self._renderer.jit.update_buffer(self.pending_buffer_updates)
-        self.pending_buffer_updates = {}
+        self.pending_buffer_updates.clear()
 
     def wait_until_initialized(self):
         self._initialized_event.wait()
@@ -683,6 +701,8 @@ class Viewer(pyglet.window.Window):
         # Render the scene
         self.clear()
         self._render()
+
+        self.viewer_interaction.on_draw()
 
         if not self._initialized_event.is_set():
             self._initialized_event.set()
@@ -745,10 +765,14 @@ class Viewer(pyglet.window.Window):
         self._renderer.viewport_height = self._viewport_size[1]
         self.on_draw()
 
-    def on_mouse_press(self, x, y, buttons, modifiers):
+    def on_mouse_motion(self, x: int, y: int, dx: int, dy: int) -> EVENT_HANDLE_STATE:
+        """The mouse was moved with no buttons held down."""
+        return self.viewer_interaction.on_mouse_motion(x, y, dx, dy)
+
+    def on_mouse_press(self, x: int, y: int, button: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record an initial mouse press."""
         self._trackball.set_state(Trackball.STATE_ROTATE)
-        if buttons == pyglet.window.mouse.LEFT:
+        if button == pyglet.window.mouse.LEFT:
             ctrl = modifiers & pyglet.window.key.MOD_CTRL
             shift = modifiers & pyglet.window.key.MOD_SHIFT
             alt = modifiers & pyglet.window.key.MOD_ALT
@@ -756,23 +780,26 @@ class Viewer(pyglet.window.Window):
                 self._trackball.set_state(Trackball.STATE_ZOOM)
             elif alt or shift:
                 self._trackball.set_state(Trackball.STATE_PAN)
-        elif buttons == pyglet.window.mouse.MIDDLE:
+        elif button == pyglet.window.mouse.MIDDLE:
             self._trackball.set_state(Trackball.STATE_PAN)
-        elif buttons == pyglet.window.mouse.RIGHT:
+        elif button == pyglet.window.mouse.RIGHT:
             self._trackball.set_state(Trackball.STATE_ZOOM)
 
         self._trackball.down(np.array([x, y]))
 
         # Stop animating while using the mouse
         self.viewer_flags["mouse_pressed"] = True
+        return self.viewer_interaction.on_mouse_press(x, y, button, modifiers)
 
-    def on_mouse_drag(self, x, y, dx, dy, buttons, modifiers):
-        """Record a mouse drag."""
+    def on_mouse_drag(self, x: int, y: int, dx: int, dy: int, buttons: int, modifiers: int) -> EVENT_HANDLE_STATE:
+        """The mouse was moved with one or more buttons held down."""
         self._trackball.drag(np.array([x, y]))
+        return self.viewer_interaction.on_mouse_drag(x, y, dx, dy, buttons, modifiers)
 
-    def on_mouse_release(self, x, y, button, modifiers):
+    def on_mouse_release(self, x: int, y: int, button: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record a mouse release."""
         self.viewer_flags["mouse_pressed"] = False
+        return self.viewer_interaction.on_mouse_release(x, y, button, modifiers)
 
     def on_mouse_scroll(self, x, y, dx, dy):
         """Record a mouse scroll."""
@@ -793,7 +820,7 @@ class Viewer(pyglet.window.Window):
             c.xmag = xmag
             c.ymag = ymag
 
-    def on_key_press(self, symbol, modifiers):
+    def on_key_press(self, symbol: int, modifiers: int) -> EVENT_HANDLE_STATE:
         """Record a key press."""
         # First, check for registered key callbacks
         if symbol in self.registered_keys:
@@ -810,7 +837,7 @@ class Viewer(pyglet.window.Window):
                 if len(tup) == 3:
                     kwargs = tup[2]
             callback(self, *args, **kwargs)
-            return
+            return self.viewer_interaction.on_key_press(symbol, modifiers)
 
         # Otherwise, use default key functions
 
@@ -951,6 +978,12 @@ class Viewer(pyglet.window.Window):
         if self._message_text is not None:
             self._message_opac = 1.0 + self._ticks_till_fade
 
+        return self.viewer_interaction.on_key_press(symbol, modifiers)
+
+    def on_key_release(self, symbol: int, modifiers: int) -> EVENT_HANDLE_STATE:
+        """Record a key release."""
+        return self.viewer_interaction.on_key_release(symbol, modifiers)
+
     @staticmethod
     def _time_event(dt, self):
         """The timer callback."""
@@ -1074,66 +1107,65 @@ class Viewer(pyglet.window.Window):
         elif self.scene.has_node(self._direct_light):
             self.scene.remove_node(self._direct_light)
 
-        if normal:
+        flags = RenderFlags.NONE
+        if self.render_flags["flip_wireframe"]:
+            flags |= RenderFlags.FLIP_WIREFRAME
+        elif self.render_flags["all_wireframe"]:
+            flags |= RenderFlags.ALL_WIREFRAME
+        elif self.render_flags["all_solid"]:
+            flags |= RenderFlags.ALL_SOLID
 
+        if self.render_flags["shadows"]:
+            flags |= RenderFlags.SHADOWS_ALL
+        if self.render_flags["plane_reflection"]:
+            flags |= RenderFlags.REFLECTIVE_FLOOR
+        if self.render_flags["env_separate_rigid"]:
+            flags |= RenderFlags.ENV_SEPARATE
+        if self.render_flags["vertex_normals"]:
+            flags |= RenderFlags.VERTEX_NORMALS
+        if self.render_flags["face_normals"]:
+            flags |= RenderFlags.FACE_NORMALS
+        if not self.render_flags["cull_faces"]:
+            flags |= RenderFlags.SKIP_CULL_FACES
+
+        if self.render_flags["offscreen"]:
+            flags |= RenderFlags.OFFSCREEN
+
+        seg_node_map = None
+        if self.render_flags["seg"]:
+            flags |= RenderFlags.SEG
+            seg_node_map = self._seg_node_map
+
+        if self.render_flags["depth"]:
+            flags |= RenderFlags.RET_DEPTH
+
+        retval = renderer.render(self.scene, flags, seg_node_map=seg_node_map)
+
+        if normal:
             class CustomShaderCache:
                 def __init__(self):
                     self.program = None
 
                 def get_program(self, vertex_shader, fragment_shader, geometry_shader=None, defines=None):
                     if self.program is None:
-                        absolute_path = os.path.abspath(__file__)
-                        print(absolute_path)
                         self.program = ShaderProgram(
-                            os.path.join(absolute_path.replace("viewer.py", ""), "shaders/mesh_normal.vert"),
-                            os.path.join(absolute_path.replace("viewer.py", ""), "shaders/mesh_normal.frag"),
+                            os.path.join(MODULE_DIR, "shaders/mesh_normal.vert"),
+                            os.path.join(MODULE_DIR, "shaders/mesh_normal.frag"),
                             defines=defines,
                         )
                     return self.program
 
+            old_cache = renderer._program_cache
             renderer._program_cache = CustomShaderCache()
 
             flags = RenderFlags.FLAT | RenderFlags.OFFSCREEN
             if self.render_flags["env_separate_rigid"]:
                 flags |= RenderFlags.ENV_SEPARATE
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT)
+            normal_arr, _ = renderer.render(scene, flags, is_first_pass=False)
+            retval = retval + (normal_arr,)
 
-            retval = renderer.render(scene, flags)
-            renderer._program_cache = ShaderProgramCache()
-
-        else:
-            flags = RenderFlags.NONE
-            if self.render_flags["flip_wireframe"]:
-                flags |= RenderFlags.FLIP_WIREFRAME
-            elif self.render_flags["all_wireframe"]:
-                flags |= RenderFlags.ALL_WIREFRAME
-            elif self.render_flags["all_solid"]:
-                flags |= RenderFlags.ALL_SOLID
-
-            if self.render_flags["shadows"]:
-                flags |= RenderFlags.SHADOWS_ALL
-            if self.render_flags["plane_reflection"]:
-                flags |= RenderFlags.REFLECTIVE_FLOOR
-            if self.render_flags["env_separate_rigid"]:
-                flags |= RenderFlags.ENV_SEPARATE
-            if self.render_flags["vertex_normals"]:
-                flags |= RenderFlags.VERTEX_NORMALS
-            if self.render_flags["face_normals"]:
-                flags |= RenderFlags.FACE_NORMALS
-            if not self.render_flags["cull_faces"]:
-                flags |= RenderFlags.SKIP_CULL_FACES
-
-            if self.render_flags["offscreen"]:
-                flags |= RenderFlags.OFFSCREEN
-
-            seg_node_map = None
-            if self.render_flags["seg"]:
-                flags |= RenderFlags.SEG
-                seg_node_map = self._seg_node_map
-
-            if self.render_flags["depth"]:
-                flags |= RenderFlags.RET_DEPTH
-
-            retval = renderer.render(self.scene, flags, seg_node_map=seg_node_map)
+            renderer._program_cache = old_cache
 
         if camera_node is not None:
             self.scene.main_camera_node = saved_camera_node

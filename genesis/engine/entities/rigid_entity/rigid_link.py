@@ -1,4 +1,7 @@
+from typing import TYPE_CHECKING
+
 import numpy as np
+from numpy.typing import ArrayLike
 import taichi as ti
 import torch
 
@@ -8,6 +11,9 @@ from genesis.repr_base import RBC
 from genesis.utils import geom as gu
 
 from .rigid_geom import RigidGeom, RigidVisGeom
+
+if TYPE_CHECKING:
+    from .rigid_entity import RigidEntity
 
 
 @ti.data_oriented
@@ -39,17 +45,19 @@ class RigidLink(RBC):
         inertial_i,
         inertial_mass,
         parent_idx,
+        root_idx,
         invweight,
         visualize_contact,
     ):
-        self._name = name
-        self._entity = entity
+        self._name: str = name
+        self._entity: "RigidEntity" = entity
         self._solver = entity.solver
         self._entity_idx_in_solver = entity.idx
 
         self._uid = gs.UID()
         self._idx = idx
         self._parent_idx = parent_idx
+        self._root_idx = root_idx
         self._child_idxs = list()
         self._invweight = invweight
 
@@ -66,16 +74,18 @@ class RigidLink(RBC):
         self._vvert_start = vvert_start
         self._vface_start = vface_start
 
-        self._pos = pos
-        self._quat = quat
-        self._inertial_pos = inertial_pos
-        self._inertial_quat = inertial_quat
+        # Link position & rotation at creation time:
+        self._pos: ArrayLike = pos
+        self._quat: ArrayLike = quat
+        # Link's center-of-mass position & principal axes frame rotation at creation time:
+        self._inertial_pos: ArrayLike = inertial_pos
+        self._inertial_quat: ArrayLike = inertial_quat
         self._inertial_mass = inertial_mass
         self._inertial_i = inertial_i
 
         self._visualize_contact = visualize_contact
 
-        self._geoms = gs.List()
+        self._geoms: list[RigidGeom] = gs.List()
         self._vgeoms = gs.List()
 
     def _build(self):
@@ -95,10 +105,11 @@ class RigidLink(RBC):
             link = solver_links[link.parent_idx]
             if not all(joint.type is gs.JOINT_TYPE.FIXED for joint in link.joints):
                 is_fixed = False
-        self.root_idx = gs.np_int(link.idx)
-        self.is_fixed = gs.np_int(is_fixed)
+        if self._root_idx is None:
+            self._root_idx = gs.np_int(link.idx)
+        self.is_fixed: np.int32 = gs.np_int(is_fixed)  # note: type inconsistent with is_built, is_free, is_leaf: bool
 
-        # inertial_mass, invweight, and inertia_i
+        # inertial_mass and inertia_i
         if self._inertial_mass is None:
             if len(self._geoms) == 0 and len(self._vgeoms) == 0:
                 self._inertial_mass = 0.0
@@ -108,11 +119,9 @@ class RigidLink(RBC):
                 else:  # TODO: handle non-watertight mesh
                     self._inertial_mass = 1.0
 
+        # Postpone computation of inverse weight if not specified
         if self._invweight is None:
-            if self._inertial_mass > 0:
-                self._invweight = 1.0 / self.inertial_mass
-            else:
-                self._invweight = np.inf
+            self._invweight = np.full((2,), fill_value=-1.0, dtype=gs.np_float)
 
         # inertial_pos
         if self._inertial_pos is None:
@@ -123,6 +132,7 @@ class RigidLink(RBC):
 
         # inertial_i
         if self._inertial_i is None:
+            # FIXME: Why coef 0.4 ???
             if self._init_mesh is None:  # use sphere inertia with radius 0.1
                 self._inertial_i = 0.4 * self._inertial_mass * 0.1**2 * np.eye(3)
 
@@ -151,7 +161,7 @@ class RigidLink(RBC):
 
         # override invweight if fixed
         if is_fixed:
-            self._invweight = 0.0
+            self._invweight = np.zeros((2,), dtype=gs.np_float)
 
     def _compose_init_mesh(self):
         if len(self._geoms) == 0 and len(self._vgeoms) == 0:
@@ -373,7 +383,8 @@ class RigidLink(RBC):
         ratio = mass / self._inertial_mass
         assert ratio > 0
         self._inertial_mass *= ratio
-        self._invweight /= ratio
+        if self._invweight is not None:
+            self._invweight /= ratio
         self._inertial_i *= ratio
 
         self._solver._kernel_adjust_link_inertia(self.idx, ratio)
@@ -436,14 +447,14 @@ class RigidLink(RBC):
         """
         The sequence of joints that connects the link to its parent link.
         """
-        return self._solver.joints[self._idx]
+        return self._solver.joints[self.joint_start : self.joint_end]
 
     @property
     def n_joints(self):
         """
         Number of the joints that connects the link to its parent link.
         """
-        return len(self.joints)
+        return self._n_joints
 
     @property
     def joint_start(self):
@@ -512,6 +523,13 @@ class RigidLink(RBC):
         return self._parent_idx
 
     @property
+    def root_idx(self):
+        """
+        The global index of the link's root link in the RigidSolver.
+        """
+        return self._root_idx
+
+    @property
     def child_idxs(self):
         """
         The global indices of the link's child links in the RigidSolver.
@@ -523,7 +541,7 @@ class RigidLink(RBC):
         """
         The local index of the link in the entity.
         """
-        return self._idx - self._entity._link_start
+        return self._idx - self._entity.link_start
 
     @property
     def parent_idx_local(self):
@@ -532,9 +550,8 @@ class RigidLink(RBC):
         """
         # TODO: check for parent links outside of the current entity (caused by scene.link_entities())
         if self._parent_idx >= 0:
-            return self._parent_idx - self._entity._link_start
-        else:
-            return self._parent_idx
+            return self._parent_idx - self._entity.link_start
+        return self._parent_idx
 
     @property
     def child_idxs_local(self):
@@ -542,7 +559,7 @@ class RigidLink(RBC):
         The local indices of the link's child links in the entity.
         """
         # TODO: check for child links outside of the current entity (caused by scene.link_entities())
-        return [idx - self._entity._link_start if idx >= 0 else idx for idx in self._child_idxs]
+        return [idx - self._entity.link_start if idx >= 0 else idx for idx in self._child_idxs]
 
     @property
     def is_leaf(self):
@@ -556,6 +573,8 @@ class RigidLink(RBC):
         """
         The invweight of the link.
         """
+        if self._invweight is None:
+            self._invweight = self._solver.get_links_invweight([self._idx]).cpu().numpy()[..., 0, :]
         return self._invweight
 
     @property

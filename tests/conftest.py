@@ -1,18 +1,22 @@
+import gc
 import os
-from itertools import chain
+import re
+import sys
 from enum import Enum
 
-import psutil
-import pyglet
-import numpy as np
 import pytest
 from _pytest.mark import Expression, MarkMatcher
 
-import mujoco
-import genesis as gs
-from genesis.utils.mesh import get_assets_dir
-
-from .utils import MjSim
+# Mock tkinter module for backward compatibility because old Genesis versions require it
+try:
+    import tkinter
+except ImportError:
+    tkinter = type(sys)("tkinter")
+    tkinter.Tk = type(sys)("Tk")
+    tkinter.filedialog = type(sys)("filedialog")
+    sys.modules["tkinter"] = tkinter
+    sys.modules["tkinter.Tk"] = tkinter.Tk
+    sys.modules["tkinter.filedialog"] = tkinter.filedialog
 
 
 TOL_SINGLE = 5e-5
@@ -27,28 +31,116 @@ def pytest_make_parametrize_id(config, val, argname):
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_cmdline_main(config: pytest.Config) -> None:
-    # Force disabling distributed framework if benchmarks are selected
+    # Make sure that benchmarks are running on GPU and the number of workers if valid
     expr = Expression.compile(config.option.markexpr)
     is_benchmarks = expr.evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
     if is_benchmarks:
-        config.option.numprocesses = 0
+        # Make sure that GPU backend is enforced
+        backend = config.getoption("--backend")
+        if backend == "cpu":
+            raise ValueError("Running benchmarks on CPU is not supported.")
+        config.option.backend = "gpu"
+
+        # Make sure that the number of workers is not too large
+        if isinstance(config.option.numprocesses, int):
+            max_workers = max(pytest_xdist_auto_num_workers(config), 1)
+            if config.option.numprocesses > max_workers:
+                raise ValueError(
+                    f"The number of workers for running benchmarks cannot exceed '{max_workers}' on this machine."
+                )
+
+    # Force disabling forked for non-linux systems
+    if not sys.platform.startswith("linux"):
+        config.option.forked = False
 
     # Force disabling distributed framework if interactive viewer is enabled
     show_viewer = config.getoption("--vis")
     if show_viewer:
         config.option.numprocesses = 0
 
+    # Disable low-level parallelization if distributed framework is enabled.
+    # FIXME: It should be set to `max(int(physical_core_count / num_workers), 1)`, but 'num_workers' may be unknown.
+    if not is_benchmarks and config.option.numprocesses != 0:
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        os.environ["NUMBA_NUM_THREADS"] = "1"
+
+
+def _get_gpu_indices():
+    nvidia_gpu_indices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if nvidia_gpu_indices is not None:
+        return tuple(sorted(map(int, nvidia_gpu_indices.split(","))))
+
+    if sys.platform == "linux":
+        nvidia_gpu_indices = []
+        nvidia_gpu_interface_path = "/proc/driver/nvidia/gpus/"
+        if os.path.exists(nvidia_gpu_interface_path):
+            for device_path in os.listdir(nvidia_gpu_interface_path):
+                with open(os.path.join(nvidia_gpu_interface_path, device_path, "information"), "r") as f:
+                    gpu_id = int(re.search(r"Device Minor:\s+(\d+)", f.read()).group(1))
+                nvidia_gpu_indices.append(gpu_id)
+            return tuple(sorted(nvidia_gpu_indices))
+
+    return (0,)
+
 
 def pytest_xdist_auto_num_workers(config):
-    # Compute the default number of workers based on available RAM, VRAM, and number of physical cores
+    import psutil
+    import genesis as gs
+
+    # Get available memory (RAM & VRAM) and number of physical cores.
     physical_core_count = psutil.cpu_count(logical=False)
     _, _, ram_memory, _ = gs.utils.get_device(gs.cpu)
     _, _, vram_memory, _ = gs.utils.get_device(gs.gpu)
-    return min(int(ram_memory / 4.0), int(vram_memory / 1.0), physical_core_count)
+
+    # Compute the default number of workers based on available RAM, VRAM, and number of physical cores.
+    # Note that if `forked` is not enabled, up to 7.5Gb per worker is necessary on Linux because Taichi
+    # does not completely release memory between each test.
+    if sys.platform == "darwin":
+        ram_memory_per_worker = 3.0
+        vram_memory_per_worker = 1.0  # Does not really makes sense on Apple Silicon
+    elif config.option.forked:
+        ram_memory_per_worker = 5.5
+        vram_memory_per_worker = 1.2
+    else:
+        ram_memory_per_worker = 7.5
+        vram_memory_per_worker = 1.6
+    num_workers = min(
+        physical_core_count,
+        max(int(ram_memory / ram_memory_per_worker), 1),
+        max(int(vram_memory / vram_memory_per_worker), 1),
+    )
+
+    # Special treatment for benchmarks
+    expr = Expression.compile(config.option.markexpr)
+    is_benchmarks = expr.evaluate(MarkMatcher.from_markers((pytest.mark.benchmarks,)))
+    if is_benchmarks:
+        num_cpu_per_gpu = 4
+        num_workers = min(
+            num_workers,
+            len(_get_gpu_indices()),
+            max(int(physical_core_count / num_cpu_per_gpu), 1),
+        )
+
+    return num_workers
+
+
+def pytest_runtest_setup(item):
+    # Enforce GPU affinity that distributed framework is enabled
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker_id and worker_id.startswith("gw"):
+        worker_num = int(worker_id[2:])
+        gpu_indices = _get_gpu_indices()
+        gpu_num = worker_num % len(gpu_indices)
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_indices[gpu_num])
+        os.environ["TI_VISIBLE_DEVICE"] = str(gpu_indices[gpu_num])
 
 
 def pytest_addoption(parser):
-    parser.addoption("--backend", action="store", default=gs.cpu, help="Default simulation backend.")
+    parser.addoption("--backend", action="store", default=None, help="Default simulation backend.")
     parser.addoption("--vis", action="store_true", default=False, help="Enable interactive viewer.")
 
 
@@ -59,7 +151,12 @@ def show_viewer(pytestconfig):
 
 @pytest.fixture(scope="session")
 def backend(pytestconfig):
-    return pytestconfig.getoption("--backend")
+    import genesis as gs
+
+    backend = pytestconfig.getoption("--backend") or gs.cpu
+    if isinstance(backend, str):
+        return getattr(gs.constants.backend, backend)
+    return backend
 
 
 @pytest.fixture(scope="session")
@@ -68,39 +165,24 @@ def asset_tmp_path(tmp_path_factory):
 
 
 @pytest.fixture
-def atol():
+def tol():
+    import numpy as np
+    import genesis as gs
+
     return TOL_DOUBLE if gs.np_float == np.float64 else TOL_SINGLE
 
 
-@pytest.fixture(scope="function", autouse=True)
-def initialize_genesis(request, backend):
-    logging_level = request.config.getoption("--log-cli-level")
-    if backend == gs.cpu:
-        precision = "64"
-        debug = True
-    else:
-        precision = "32"
-        debug = False
-    gs.init(backend=backend, precision=precision, debug=debug, seed=0, logging_level=logging_level)
-    if backend != gs.cpu and gs.backend == gs.cpu:
-        gs.destroy()
-        pytest.skip("No GPU available on this machine")
-    yield
-    pyglet.app.exit()
-    gs.destroy()
-
-
 @pytest.fixture
-def mpr_vanilla(request):
-    mpr_vanilla = None
-    for mark in request.node.iter_markers("mpr_vanilla"):
+def mujoco_compatibility(request):
+    mujoco_compatibility = None
+    for mark in request.node.iter_markers("mujoco_compatibility"):
         if mark.args:
-            if mpr_vanilla is not None:
-                pytest.fail("'mpr_vanilla' can only be specified once.")
-            (mpr_vanilla,) = mark.args
-    if mpr_vanilla is None:
-        mpr_vanilla = True
-    return mpr_vanilla
+            if mujoco_compatibility is not None:
+                pytest.fail("'mujoco_compatibility' can only be specified once.")
+            (mujoco_compatibility,) = mark.args
+    if mujoco_compatibility is None:
+        mujoco_compatibility = True
+    return mujoco_compatibility
 
 
 @pytest.fixture
@@ -114,6 +196,32 @@ def adjacent_collision(request):
     if adjacent_collision is None:
         adjacent_collision = False
     return adjacent_collision
+
+
+@pytest.fixture
+def gjk_collision(request):
+    gjk_collision = None
+    for mark in request.node.iter_markers("gjk_collision"):
+        if mark.args:
+            if gjk_collision is not None:
+                pytest.fail("'gjk_collision' can only be specified once.")
+            (gjk_collision,) = mark.args
+    if gjk_collision is None:
+        gjk_collision = False
+    return gjk_collision
+
+
+@pytest.fixture
+def merge_fixed_links(request):
+    merge_fixed_links = None
+    for mark in request.node.iter_markers("merge_fixed_links"):
+        if mark.args:
+            if merge_fixed_links is not None:
+                pytest.fail("'merge_fixed_links' can only be specified once.")
+            (merge_fixed_links,) = mark.args
+    if merge_fixed_links is None:
+        merge_fixed_links = True
+    return merge_fixed_links
 
 
 @pytest.fixture
@@ -143,96 +251,135 @@ def dof_damping(request):
 
 
 @pytest.fixture
-def mj_sim(xml_path, gs_solver, gs_integrator, multi_contact, adjacent_collision, dof_damping):
-    if gs_solver == gs.constraint_solver.CG:
-        mj_solver = mujoco.mjtSolver.mjSOL_CG
-    elif gs_solver == gs.constraint_solver.Newton:
-        mj_solver = mujoco.mjtSolver.mjSOL_NEWTON
-    else:
-        raise ValueError(f"Solver '{gs_solver}' not supported")
-    if gs_integrator == gs.integrator.Euler:
-        mj_integrator = mujoco.mjtIntegrator.mjINT_EULER
-    elif gs_integrator == gs.integrator.implicitfast:
-        mj_integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-    else:
-        raise ValueError(f"Integrator '{gs_integrator}' not supported")
+def taichi_offline_cache(request):
+    taichi_offline_cache = None
+    for mark in request.node.iter_markers("taichi_offline_cache"):
+        if mark.args:
+            if taichi_offline_cache is not None:
+                pytest.fail("'taichi_offline_cache' can only be specified once.")
+            (taichi_offline_cache,) = mark.args
+    if taichi_offline_cache is None:
+        taichi_offline_cache = True
+    return taichi_offline_cache
 
-    if not os.path.isabs(xml_path):
-        xml_path = os.path.join(get_assets_dir(), xml_path)
 
-    model = mujoco.MjModel.from_xml_path(xml_path)
-    model.opt.solver = mj_solver
-    model.opt.integrator = mj_integrator
-    model.opt.cone = mujoco.mjtCone.mjCONE_PYRAMIDAL
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_EULERDAMP)
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_REFSAFE)
-    model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_GRAVITY)
-    model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_NATIVECCD
-    if multi_contact:
-        model.opt.enableflags |= mujoco.mjtEnableBit.mjENBL_MULTICCD
+@pytest.fixture(scope="function", autouse=True)
+def initialize_genesis(request, backend, taichi_offline_cache):
+    import pyglet
+    import genesis as gs
+    from genesis.utils.misc import ALLOCATE_TENSOR_WARNING
+
+    logging_level = request.config.getoption("--log-cli-level")
+    if backend == gs.cpu:
+        precision = "64"
+        debug = True
     else:
-        model.opt.enableflags &= ~np.uint32(mujoco.mjtEnableBit.mjENBL_MULTICCD)
-    if adjacent_collision:
-        model.opt.disableflags |= mujoco.mjtDisableBit.mjDSBL_FILTERPARENT
-    else:
-        model.opt.disableflags &= ~np.uint32(mujoco.mjtDisableBit.mjDSBL_FILTERPARENT)
-    data = mujoco.MjData(model)
+        precision = "32"
+        debug = False
 
-    # Joint damping is not properly supported in Genesis for now
-    if not dof_damping:
-        model.dof_damping[:] = 0.0
+    try:
+        if not taichi_offline_cache:
+            os.environ["TI_OFFLINE_CACHE"] = "0"
 
-    return MjSim(model, data)
+        gs.init(backend=backend, precision=precision, debug=debug, seed=0, logging_level=logging_level)
+        gs.logger.addFilter(lambda record: ALLOCATE_TENSOR_WARNING not in record.getMessage())
+        if backend != gs.cpu and gs.backend == gs.cpu:
+            gs.destroy()
+            pytest.skip("No GPU available on this machine")
+        yield
+    finally:
+        pyglet.app.exit()
+        gs.destroy()
+        gc.collect()
+
+
+@pytest.fixture
+def mj_sim(
+    xml_path, gs_solver, gs_integrator, merge_fixed_links, multi_contact, adjacent_collision, dof_damping, gjk_collision
+):
+    from .utils import build_mujoco_sim
+
+    return build_mujoco_sim(
+        xml_path,
+        gs_solver,
+        gs_integrator,
+        merge_fixed_links,
+        multi_contact,
+        adjacent_collision,
+        dof_damping,
+        gjk_collision,
+    )
 
 
 @pytest.fixture
 def gs_sim(
-    xml_path, gs_solver, gs_integrator, multi_contact, mpr_vanilla, adjacent_collision, dof_damping, show_viewer, mj_sim
+    xml_path,
+    gs_solver,
+    gs_integrator,
+    merge_fixed_links,
+    multi_contact,
+    mujoco_compatibility,
+    adjacent_collision,
+    gjk_collision,
+    show_viewer,
+    mj_sim,
 ):
-    scene = gs.Scene(
-        viewer_options=gs.options.ViewerOptions(
-            camera_pos=(3, -1, 1.5),
-            camera_lookat=(0.0, 0.0, 0.5),
-            camera_fov=30,
-            res=(960, 640),
-            max_FPS=60,
-        ),
-        sim_options=gs.options.SimOptions(
-            dt=mj_sim.model.opt.timestep,
-            substeps=1,
-            gravity=mj_sim.model.opt.gravity.tolist(),
-        ),
-        rigid_options=gs.options.RigidOptions(
-            integrator=gs_integrator,
-            constraint_solver=gs_solver,
-            enable_mpr_vanilla=mpr_vanilla,
-            box_box_detection=True,
-            enable_self_collision=True,
-            enable_adjacent_collision=adjacent_collision,
-            enable_multi_contact=multi_contact,
-            iterations=mj_sim.model.opt.iterations,
-            tolerance=mj_sim.model.opt.tolerance,
-            ls_iterations=mj_sim.model.opt.ls_iterations,
-            ls_tolerance=mj_sim.model.opt.ls_tolerance,
-        ),
-        show_viewer=show_viewer,
-        show_FPS=False,
+    from .utils import build_genesis_sim
+
+    return build_genesis_sim(
+        xml_path,
+        gs_solver,
+        gs_integrator,
+        merge_fixed_links,
+        multi_contact,
+        mujoco_compatibility,
+        adjacent_collision,
+        gjk_collision,
+        show_viewer,
+        mj_sim,
     )
-    gs_robot = scene.add_entity(
-        gs.morphs.MJCF(file=xml_path),
-        visualize_contact=True,
-    )
-    gs_sim = scene.sim
 
-    # Force matching Mujoco safety factor for constraint time constant.
-    # Note that this time constant affects the penetration depth at rest.
-    gs_sim.rigid_solver._sol_constraint_min_resolve_time = 2.0 * gs_sim._substep_dt
 
-    # Joint damping is not properly supported in Genesis for now
-    if not dof_damping:
-        for joint in chain.from_iterable(gs_robot.joints):
-            joint.dofs_damping[:] = 0.0
+@pytest.fixture(scope="session")
+def cube_verts_and_faces():
+    cx, cy, cz = (0.0, 0.0, 0.0)
+    edge_length = 1.0
 
-    scene.build()
+    h = edge_length / 2.0
 
-    return gs_sim
+    verts = [
+        (cx - h, cy - h, cz - h),  # v0
+        (cx + h, cy - h, cz - h),  # v1
+        (cx + h, cy + h, cz - h),  # v2
+        (cx - h, cy + h, cz - h),  # v3
+        (cx - h, cy - h, cz + h),  # v4
+        (cx + h, cy - h, cz + h),  # v5
+        (cx + h, cy + h, cz + h),  # v6
+        (cx - h, cy + h, cz + h),  # v7
+    ]
+
+    faces = [
+        (1, 2, 3, 4),
+        (5, 6, 7, 8),
+        (1, 2, 6, 5),
+        (2, 3, 7, 6),
+        (3, 4, 8, 7),
+        (4, 1, 5, 8),
+    ]
+    return verts, faces
+
+
+@pytest.fixture(scope="session")
+def box_obj_path(asset_tmp_path, cube_verts_and_faces):
+    """Fixture that generates a temporary cube .obj file"""
+    verts, faces = cube_verts_and_faces
+
+    filename = str(asset_tmp_path / f"fixture_box_obj_path.obj")
+    with open(filename, "w", encoding="utf-8") as f:
+        for x, y, z in verts:
+            f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+        f.write("\n")
+        for a, b, c, d in faces:
+            f.write(f"f {a} {b} {c} {d}\n")
+
+    return filename

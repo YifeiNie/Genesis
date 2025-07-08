@@ -18,6 +18,7 @@
 # Genesis
 
 ## 🔥 News
+- [2025-07-02] The development of Genesis is now officially supported by [Genesis AI](https://genesis-ai.company/).
 - [2025-01-09] We released a [detailed performance benchmarking and comparison report](https://github.com/zhouxian/genesis-speed-benchmark) on Genesis, together with all the test scripts.
 - [2025-01-08] Released v0.2.1 🎊 🎉
 - [2025-01-08] Created [Discord](https://discord.gg/nukCuhB47p) and [Wechat](https://drive.google.com/uc?export=view&id=1ZS9nnbQ-t1IwkzJlENBYqYIIOOZhXuBZ) group.
@@ -85,7 +86,7 @@ pip install git+https://github.com/Genesis-Embodied-AI/Genesis.git
 ```
 Note that the package must still be updated manually to sync with main branch.
 
-Users seeking to edit the source code of Genesis are encourage to install Genesis in developper mode. First, make sure that `genesis-world` has been uninstalled, then clone the repository and install locally:
+Users seeking to edit the source code of Genesis are encourage to install Genesis in editable mode. First, make sure that `genesis-world` has been uninstalled, then clone the repository and install locally:
 ```bash
 git clone https://github.com/Genesis-Embodied-AI/Genesis.git
 cd Genesis
@@ -112,6 +113,31 @@ docker run --gpus all --rm -it \
 -v $PWD:/workspace \
 genesis
 ```
+
+### AMD users
+AMD users can use Genesis using the `docker/Dockerfile.amdgpu` file, which is built by running:
+```
+docker build -t genesis-amd -f docker/Dockerfile.amdgpu docker
+```
+
+and can then be used by running:
+
+```xhost +local:docker \
+docker run -it --network=host \
+ --device=/dev/kfd \
+ --device=/dev/dri \
+ --group-add=video \
+ --ipc=host \
+ --cap-add=SYS_PTRACE \
+ --security-opt seccomp=unconfined \
+ --shm-size 8G \
+ -v $PWD:/workspace \
+ -e DISPLAY=$DISPLAY \
+ genesis-amd
+ ```
+
+The examples will be accessible from `/workspace/examples`. Note: AMD users should use the vulkan backend. This means you will need to call `gs.init(vulkan)` to initialise Genesis.
+
 
 ## Documentation
 
@@ -178,9 +204,9 @@ Genesis is a large scale effort that integrates state-of-the-art technologies of
 If you use Genesis in your research, please consider citing:
 
 ```bibtex
-@software{Genesis,
+@misc{Genesis,
   author = {Genesis Authors},
-  title = {Genesis: A Universal and Generative Physics Engine for Robotics and Beyond},
+  title = {Genesis: A Generative and Universal Physics Engine for Robotics and Beyond},
   month = {December},
   year = {2024},
   url = {https://github.com/Genesis-Embodied-AI/Genesis}
