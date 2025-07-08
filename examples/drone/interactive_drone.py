@@ -96,6 +96,7 @@ def run_sim(scene, drone, controller):
         try:
             # Update drone with current RPMs
             rpms = controller.update_thrust()
+            # print(drone.get_ang())
             drone.set_propellels_rpm(rpms)
 
             # Update physics

@@ -385,9 +385,9 @@ class RigidGeom(RBC):
         sdf value from mesh coordinate
         """
         if recompute:
-            return self._compute_sd(np.array([pos_mesh]))
+            return self._compute_sd(np.array(pos_mesh.cpu()))
         else:
-            pos_sdf = gu.transform_by_T(pos_mesh, self.T_mesh_to_sdf)
+            pos_sdf = gu.transform_by_T(pos_mesh.cpu(), self.T_mesh_to_sdf)
             return self.sdf_sdf(pos_sdf)
 
     def sdf_sdf(self, pos_sdf):
