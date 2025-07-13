@@ -730,6 +730,8 @@ class RigidEntity(Entity):
                 morph.convexify,
                 decompose_error_threshold,
                 morph.coacd_options,
+                morph.use_3rd_file,
+                morph.scale,
             )
 
         # Randomize collision mesh colors. The is especially useful to check convex decomposition.

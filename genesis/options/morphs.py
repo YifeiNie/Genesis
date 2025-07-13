@@ -416,6 +416,7 @@ class FileMorph(Morph):
     decompose_robot_error_threshold: float = float("inf")
     coacd_options: Optional[CoacdOptions] = None
     recompute_inertia: bool = False
+    use_3rd_file: str = None
 
     def __init__(self, **data):
         super().__init__(**data)

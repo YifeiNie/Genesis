@@ -287,7 +287,15 @@ def convex_decompose(mesh, coacd_options):
 
 
 def postprocess_collision_geoms(
-    g_infos, decimate, decimate_face_num, decimate_aggressiveness, convexify, decompose_error_threshold, coacd_options
+    g_infos, 
+    decimate, 
+    decimate_face_num, 
+    decimate_aggressiveness, 
+    convexify, 
+    decompose_error_threshold, 
+    coacd_options, 
+    use_3rd_file=None,
+    scale=None,
 ):
     # Early return if there is no geometry to process
     if not g_infos:
@@ -344,82 +352,97 @@ def postprocess_collision_geoms(
                 if volume_err > decompose_error_threshold:
                     must_decompose = True
 
-    # Check whether merging the geometries is possible, i.e.
-    # * They are all meshes
-    # * They belong to the same collision group (same contype and conaffinity)
-    # * Their physical properties are the same (friction coef and contact solver parameters)
-    if must_decompose and len(g_infos) > 1:
-        is_merged = all(g_info["type"] == gs.GEOM_TYPE.MESH for g_info in g_infos)
-        for name in ("contype", "conaffinity", "friction", "sol_params"):
-            if not is_merged:
-                break
-            values = np.stack([g_info.get(name, float("nan")) for g_info in g_infos], axis=0)
-            diffs = np.diff(values, axis=0)
-            if not (np.isnan(diffs).all(axis=0) | (np.abs(diffs) < gs.EPS).all(axis=0)).all():
-                is_merged = False
+    if not convexify and (use_3rd_file is not None):
+        _g_infos = []
+        tmesh = trimesh.load(use_3rd_file, force="mesh")
+        _g_infos.append(
+            dict(
+                contype=1,
+                conaffinity=1,
+                mesh=gs.Mesh.from_trimesh(tmesh, scale=scale, surface=gs.surfaces.Collision()),
+                type=gs.GEOM_TYPE.MESH,
+                sol_params=gu.default_solver_params(),
+            )
+        )
+        g_infos = _g_infos        
 
-        # Must apply geometry transform before merge concatenation
-        if is_merged:
-            tmeshes = []
+    else:
+        # Check whether merging the geometries is possible, i.e.
+        # * They are all meshes
+        # * They belong to the same collision group (same contype and conaffinity)
+        # * Their physical properties are the same (friction coef and contact solver parameters)
+        if must_decompose and len(g_infos) > 1:
+            is_merged = all(g_info["type"] == gs.GEOM_TYPE.MESH for g_info in g_infos)
+            for name in ("contype", "conaffinity", "friction", "sol_params"):
+                if not is_merged:
+                    break
+                values = np.stack([g_info.get(name, float("nan")) for g_info in g_infos], axis=0)
+                diffs = np.diff(values, axis=0)
+                if not (np.isnan(diffs).all(axis=0) | (np.abs(diffs) < gs.EPS).all(axis=0)).all():
+                    is_merged = False
+
+            # Must apply geometry transform before merge concatenation
+            if is_merged:
+                tmeshes = []
+                for g_info in g_infos:
+                    mesh = g_info["mesh"]
+                    tmesh = mesh.trimesh.copy()
+                    pos = g_info.get("pos", gu.zero_pos())
+                    quat = g_info.get("quat", gu.identity_quat())
+                    tmesh.apply_transform(gs.utils.geom.trans_quat_to_T(pos, quat))
+                    tmeshes.append(tmesh)
+                tmesh = trimesh.util.concatenate(tmeshes)
+                mesh = gs.Mesh.from_trimesh(mesh=tmesh, surface=gs.surfaces.Collision(), metadata={"merged": True})
+                g_infos = [{**g_infos[0], **dict(mesh=mesh, pos=gu.zero_pos(), quat=gu.identity_quat())}]
+
+            # Try again to convexify then apply convex decomposition if not possible
+            if is_merged:
+                return postprocess_collision_geoms(
+                    g_infos,
+                    decimate,
+                    decimate_face_num,
+                    decimate_aggressiveness,
+                    convexify,
+                    decompose_error_threshold,
+                    coacd_options,
+                )
+
+        if must_decompose:
+            if math.isinf(volume_err):
+                gs.logger.info(
+                    "Collision mesh has inconsistent winding and 'decompose_error_threshold' != float('inf'). "
+                    "Falling back to more expensive convex decomposition (see FileMorph options)."
+                )
+            else:
+                gs.logger.info(
+                    f"Convex hull is not accurate enough for collision detection ({volume_err:.3f}). Falling back to more "
+                    "expensive convex decomposition (see FileMorph options)."
+                )
+            _g_infos = []
             for g_info in g_infos:
                 mesh = g_info["mesh"]
-                tmesh = mesh.trimesh.copy()
-                pos = g_info.get("pos", gu.zero_pos())
-                quat = g_info.get("quat", gu.identity_quat())
-                tmesh.apply_transform(gs.utils.geom.trans_quat_to_T(pos, quat))
-                tmeshes.append(tmesh)
-            tmesh = trimesh.util.concatenate(tmeshes)
-            mesh = gs.Mesh.from_trimesh(mesh=tmesh, surface=gs.surfaces.Collision(), metadata={"merged": True})
-            g_infos = [{**g_infos[0], **dict(mesh=mesh, pos=gu.zero_pos(), quat=gu.identity_quat())}]
-
-        # Try again to convexify then apply convex decomposition if not possible
-        if is_merged:
-            return postprocess_collision_geoms(
-                g_infos,
-                decimate,
-                decimate_face_num,
-                decimate_aggressiveness,
-                convexify,
-                decompose_error_threshold,
-                coacd_options,
-            )
-
-    if must_decompose:
-        if math.isinf(volume_err):
-            gs.logger.info(
-                "Collision mesh has inconsistent winding and 'decompose_error_threshold' != float('inf'). "
-                "Falling back to more expensive convex decomposition (see FileMorph options)."
-            )
-        else:
-            gs.logger.info(
-                f"Convex hull is not accurate enough for collision detection ({volume_err:.3f}). Falling back to more "
-                "expensive convex decomposition (see FileMorph options)."
-            )
-        _g_infos = []
-        for g_info in g_infos:
-            mesh = g_info["mesh"]
-            tmesh = mesh.trimesh
-            if g_info["type"] != gs.GEOM_TYPE.MESH:
-                volume_err = 0.0
-            if not tmesh.is_winding_consistent:
-                volume_err = float("inf")
-            elif abs(tmesh.volume) < gs.EPS:
-                volume_err = 0.0
-            else:
-                cmesh = trimesh.convex.convex_hull(tmesh)
-                volume_err = cmesh.volume / abs(tmesh.volume) - 1.0
-            if volume_err > decompose_error_threshold:  # Note that 'inf' is not larger than 'inf'
-                tmeshes = convex_decompose(tmesh, coacd_options)
-                meshes = [
-                    gs.Mesh.from_trimesh(
-                        tmesh, surface=gs.surfaces.Collision(), metadata={**mesh.metadata, "decomposed": True}
-                    )
-                    for tmesh in tmeshes
-                ]
-                _g_infos += [{**g_info, **dict(mesh=mesh)} for mesh in meshes]
-            else:
-                _g_infos.append(g_info)
-        g_infos = _g_infos
+                tmesh = mesh.trimesh
+                if g_info["type"] != gs.GEOM_TYPE.MESH:
+                    volume_err = 0.0
+                if not tmesh.is_winding_consistent:
+                    volume_err = float("inf")
+                elif abs(tmesh.volume) < gs.EPS:
+                    volume_err = 0.0
+                else:
+                    cmesh = trimesh.convex.convex_hull(tmesh)
+                    volume_err = cmesh.volume / abs(tmesh.volume) - 1.0
+                if volume_err > decompose_error_threshold:  # Note that 'inf' is not larger than 'inf'
+                    tmeshes = convex_decompose(tmesh, coacd_options)
+                    meshes = [
+                        gs.Mesh.from_trimesh(
+                            tmesh, surface=gs.surfaces.Collision(), metadata={**mesh.metadata, "decomposed": True}
+                        )
+                        for tmesh in tmeshes
+                    ]
+                    _g_infos += [{**g_info, **dict(mesh=mesh)} for mesh in meshes]
+                else:
+                    _g_infos.append(g_info)
+            g_infos = _g_infos
 
     # Process of meshes sequentially
     _g_infos = []
