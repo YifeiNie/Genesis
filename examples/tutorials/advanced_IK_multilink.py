@@ -63,7 +63,7 @@ for i in range(0, 2000):
     q = robot.inverse_kinematics_multilink(
         links=[left_finger, right_finger],
         poss=[target_pos_left, target_pos_right],
-        quats=[target_quat, tar],
+        quats=[target_quat, target_quat],
         rot_mask=[False, False, True],  # only restrict direction of z-axis
     )
 
