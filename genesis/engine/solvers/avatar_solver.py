@@ -1,5 +1,5 @@
 import numpy as np
-import taichi as ti
+import gstaichi as ti
 import genesis as gs
 from genesis.engine.entities import AvatarEntity
 from genesis.engine.states.solvers import AvatarSolverState
@@ -57,7 +57,9 @@ class AvatarSolver(RigidSolver):
 
     @ti.kernel
     def _kernel_forward_kinematics_links_geoms(self, envs_idx: ti.types.ndarray()):
-        for i_b in envs_idx:
+        for i_b_ in range(envs_idx.shape[0]):
+            i_b = envs_idx[i_b_]
+
             self._func_forward_kinematics(
                 i_b,
                 self.links_state,
