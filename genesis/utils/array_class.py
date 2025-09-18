@@ -129,6 +129,8 @@ class StructConstraintState:
     efc_D: V_ANNOTATION
     efc_frictionloss: V_ANNOTATION
     efc_force: V_ANNOTATION
+    efc_b: V_ANNOTATION
+    efc_AR: V_ANNOTATION
     active: V_ANNOTATION
     prev_active: V_ANNOTATION
     qfrc_constraint: V_ANNOTATION
@@ -169,6 +171,18 @@ def get_constraint_state(constraint_solver, solver):
             "Consider reducing the number of constraints or the number of degrees of freedom."
         )
 
+    if solver._static_rigid_sim_config.noslip_iterations > 0:
+        if len_constraints_ * len_constraints_ * f_batch()[0] > 2 * 10**9:
+            gs.logger.warning(
+                f"efc_AR shape {len_constraints_}x{len_constraints_}x{f_batch()[0]} is very large. Consider manually "
+                f"set a smaller 'max_collision_pairs' in RigidOptions to reduce the size of reserved memory. "
+            )
+        efc_AR_shape = solver._batch_shape((len_constraints_, len_constraints_))
+        efc_b_shape = solver._batch_shape(len_constraints_)
+    else:
+        efc_AR_shape = 1
+        efc_b_shape = 1
+
     kwargs = {
         "n_constraints": V(dtype=gs.ti_int, shape=f_batch()),
         "ti_n_equalities": V(gs.ti_int, shape=solver._batch_shape()),
@@ -189,6 +203,8 @@ def get_constraint_state(constraint_solver, solver):
         "efc_D": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
         "efc_frictionloss": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
         "efc_force": V(dtype=gs.ti_float, shape=solver._batch_shape(len_constraints_)),
+        "efc_b": V(dtype=gs.ti_float, shape=efc_b_shape),
+        "efc_AR": V(dtype=gs.ti_float, shape=efc_AR_shape),
         "active": V(dtype=gs.ti_bool, shape=solver._batch_shape(len_constraints_)),
         "prev_active": V(dtype=gs.ti_int, shape=solver._batch_shape(len_constraints_)),
         "qfrc_constraint": V(dtype=gs.ti_float, shape=solver._batch_shape(solver.n_dofs_)),
@@ -528,7 +544,10 @@ def get_collider_info(solver, n_vert_neighbors, collider_static_config):
     terrain_hf_shape = 1
     if collider_static_config.has_terrain:
         links_idx = solver.geoms_info.link_idx.to_numpy()[solver.geoms_info.type.to_numpy() == gs.GEOM_TYPE.TERRAIN]
-        entity = solver._entities[solver.links_info.entity_idx.to_numpy()[links_idx[0]]]
+        entity_idx = solver.links_info.entity_idx.to_numpy()[links_idx[0]]
+        if isinstance(entity_idx, np.ndarray):
+            entity_idx = entity_idx[0]
+        entity = solver._entities[entity_idx]
         terrain_hf_shape = entity.terrain_hf.shape
 
     kwargs = {
@@ -1867,7 +1886,7 @@ def get_vgeoms_info(solver):
         return ClassVgeomsInfo()
 
 
-# =========================================== VgeomsState ===========================================
+# =========================================== VGeomsState ===========================================
 
 
 @dataclasses.dataclass
@@ -2013,6 +2032,7 @@ cache_value = partial(dataclasses.field, metadata={FIELD_METADATA_CACHE_VALUE: T
 @dataclasses.dataclass
 class StaticRigidSimCacheKey:
     para_level: int = cache_value()
+    use_gjk_collision: bool = cache_value()
     use_hibernation: bool = cache_value()
     batch_links_info: bool = cache_value()
     batch_dofs_info: bool = cache_value()
@@ -2025,11 +2045,37 @@ class StaticRigidSimCacheKey:
     integrator: int = cache_value()
     sparse_solve: bool = cache_value()
     solver_type: int = cache_value()
+    # dynamic properties
+    substep_dt: float = cache_value()
+    iterations: int = cache_value()
+    tolerance: float = cache_value()
+    ls_iterations: int = cache_value()
+    ls_tolerance: float = cache_value()
+    noslip_iterations: int = cache_value()
+    noslip_tolerance: float = cache_value()
+    n_equalities: int = cache_value()
+    n_equalities_candidate: int = cache_value()
+    hibernation_thresh_acc: float = cache_value()
+    hibernation_thresh_vel: float = cache_value()
+    # other config
+    has_nonconvex_nonterrain: bool = cache_value()
+    has_terrain: bool = cache_value()
 
 
 def get_static_rigid_sim_cache_key(solver):
+    is_convex = np.array([geom.is_convex for geom in solver.geoms], dtype=gs.np_int)
+    type = np.array([geom.type for geom in solver.geoms], dtype=gs.np_int)
+    has_nonconvex_nonterrain = bool(
+        np.logical_and(
+            is_convex == 0,
+            type != gs.GEOM_TYPE.TERRAIN,
+        ).any()
+    )
+    has_terrain = bool((type == gs.GEOM_TYPE.TERRAIN).any())
+
     kwargs = {
         "para_level": solver.sim._para_level,
+        "use_gjk_collision": getattr(solver._options, "use_gjk_collision", False),
         "use_hibernation": getattr(solver, "_use_hibernation", False),
         "batch_links_info": getattr(solver._options, "batch_links_info", False),
         "batch_dofs_info": getattr(solver._options, "batch_dofs_info", False),
@@ -2042,6 +2088,22 @@ def get_static_rigid_sim_cache_key(solver):
         "integrator": getattr(solver, "_integrator", gs.integrator.implicitfast),
         "sparse_solve": getattr(solver._options, "sparse_solve", False),
         "solver_type": getattr(solver._options, "constraint_solver", gs.constraint_solver.CG),
+        # dynamic properties
+        # TODO: we should store those properties into field/ndarray to avoid recompilation when they are changed
+        "substep_dt": getattr(solver, "_substep_dt", 1e-2),
+        "iterations": getattr(solver._options, "iterations", 10),
+        "tolerance": getattr(solver._options, "tolerance", 1e-6),
+        "ls_iterations": getattr(solver._options, "ls_iterations", 10),
+        "ls_tolerance": getattr(solver._options, "ls_tolerance", 1e-6),
+        "noslip_iterations": getattr(solver._options, "noslip_iterations", 0),
+        "noslip_tolerance": getattr(solver._options, "noslip_tolerance", 1e-6),
+        "n_equalities": getattr(solver, "_n_equalities", 0),
+        "n_equalities_candidate": getattr(solver, "n_equalities_candidate", 0),
+        "hibernation_thresh_acc": getattr(solver, "_hibernation_thresh_acc", 0.0),
+        "hibernation_thresh_vel": getattr(solver, "_hibernation_thresh_vel", 0.0),
+        # other config
+        "has_nonconvex_nonterrain": has_nonconvex_nonterrain,
+        "has_terrain": has_terrain,
     }
     return StaticRigidSimCacheKey(**kwargs)
 
